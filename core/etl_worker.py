@@ -14,6 +14,77 @@ from .parsing import (
     parse_and_align_authors,
 )
 
+import re
+
+def _contains_cjk(text: str) -> bool:
+    if not text:
+        return False
+    for ch in str(text):
+        if "\u4e00" <= ch <= "\u9fff":
+            return True
+    return False
+
+def _get_potential_surnames(full_name: str) -> set[str]:
+    if not full_name:
+        return set()
+    text = str(full_name).strip()
+    if not text:
+        return set()
+    surnames = set()
+    if "," in text:
+        parts = text.split(",", 1)
+        surnames.add(parts[0].strip().upper())
+    else:
+        tokens = text.split()
+        if tokens:
+            surnames.add(tokens[0].strip().upper())
+            surnames.add(tokens[-1].strip().upper())
+    return {s for s in surnames if s}
+
+_COMMON_CHINESE_SURNAMES = {
+    "LI","WANG","ZHANG","LIU","CHEN","YANG","ZHAO","HUANG","ZHOU","WU","XU","SUN","MA","ZHU","HU","GUO","HE","GAO","LIN","LUO","ZHENG","LIANG","XIE","SONG","TANG","HAN","FENG","PENG","CUI","JIANG","QIAN","QIN","YU","LU","SHI","YAO","CAO","DENG","YUAN","XIAO","XIONG","TAN","QIU","REN","YAN","DONG","CHENG","LAI","FAN","JIN","JIA","NI","SHEN","LIAO","LAN","QIAO","OU","HONG","CAI","PAN","TIAN","DU","DAI","XIA","ZHONG","YI","ZOU","SU","GU","HOU","WEI","TAO","FANG","BAI","HAO","KONG","SHAO","MENG","QUAN","WAN","LEI","BO","YIN","CHI","CHANG","MIAO","LUAN","YOU","GE","GONG","XING","RONG","WENG","JI","PING","BAO","MU","CHAN","WONG","LEE","CHEUNG","LAU","NG","YEUNG","YU","TSANG","CHUI","HO","KWOK","SUNG","POON","CHUNG","LEUNG","LAM","CHIANG","FONG","MOK","HUI","CHOI","SIN","TSUI","YIP","LUK","SIT","TAM","YIM","KAM","KWAN","TSE","AU","CHIU","CHOW","KO","LO","SIU","YUEN","YAU","FUNG","CHU","SHUM","YIU","TIN","TUNG","NGAN","LOK","HA","MO","HUNG","KUI","SHEK","LIM","CHUA","GOH","ONG","TEH","TEO","KOH","YEW","TEE","SOO","KHOO","YONG","FOO","CHEAH","TIAH","GAN","SIM","NEO","HENG","QUEK","AW","SEOW","LIAW","HOO","OON","TOH","DING","XUE","YE","CONG","YUE","CEN","XUN","PU","ZHA","SHUI","JIAO","ZHUANG","QU","YAN","MU","BU","SHA","NA","HE"
+}
+
+_LIKELY_KOREAN_SURNAMES = {"KIM","PARK","JEONG","MOON","SHIN","KANG","CHO","YUN","JANG"}
+
+def _is_chinese_name(full_name: str, short_name: str) -> bool:
+    combined = f"{full_name} {short_name}".strip()
+    if _contains_cjk(combined):
+        return True
+    candidates = _get_potential_surnames(full_name or short_name)
+    for sur in candidates:
+        if sur in _COMMON_CHINESE_SURNAMES:
+            return True
+    return False
+
+def _is_china_country(country: str) -> bool:
+    if not country:
+        return False
+    text = str(country).upper()
+    # 港澳台不视为中国大陆
+    if any(re.search(rf"\b{re.escape(kw)}\b", text) for kw in ["HONG KONG", "MACAU", "MACAO", "TAIWAN"]):
+        return False
+    return any(re.search(rf"\b{re.escape(kw)}\b", text) for kw in ["CHINA", "PEOPLES R CHINA", "P R CHINA", "PR CHINA", "MAINLAND CHINA"])
+
+def _is_non_chinese_asian_country(country: str) -> bool:
+    if not country:
+        return False
+    text = str(country).upper()
+    keywords = ["VIETNAM","VIET NAM","SOUTH KOREA","NORTH KOREA","REP KOREA","REPUBLIC OF KOREA","KOREA","JAPAN"]
+    for kw in keywords:
+        if re.search(rf"\b{re.escape(kw)}\b", text):
+            return True
+    return False
+
+def classify_ethnic_chinese(full_name: str, short_name: str, country: str) -> str:
+    if _is_china_country(country):
+        return "国内华人"
+    if _is_chinese_name(full_name, short_name):
+        if _is_non_chinese_asian_country(country):
+            return "外国人"
+        return "海外华人"
+    return "外国人"
+
 
 # 默认列名配置，可被外部参数覆盖
 DEFAULT_COLUMNS: Dict[str, str] = {
@@ -272,18 +343,22 @@ def process_file(
                 # 优先使用 contact 中已有的 full_name（来自 Addresses 列）
                 # 如果没有，则从 full_map 中查找（来自 Author Full Names 列）
                 full_name = contact.full_name or full_map.get(short_name) or ""
+                similarity = getattr(contact, "similarity", 0.0) or 0.0
+                ethnic = classify_ethnic_chinese(full_name, short_name, country)
                 records_batch.append(
                     (
                         file_name,
                         int(idx),
                         short_name,
                         country,
+                        ethnic,
                         full_name,
                         email,
                         wos_cat,
                         research_areas,
                         reprint_str,
                         email_str,
+                        float(similarity),
                     )
                 )
             success_rows += 1

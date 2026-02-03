@@ -14,6 +14,7 @@ class AuthorContact(NamedTuple):
     email: str
     country: str
     full_name: Optional[str] = None  # 当使用 Addresses 列时，可直接存储完整名字
+    similarity: float = 0.0
 
 
 def _normalize_whitespace(text: str) -> str:
@@ -365,11 +366,12 @@ def parse_and_align_authors(
 
     # 场景 A：单邮箱场景，使用 Reprint Addresses 列
     if n_email == 1:
-        # 单作者单邮箱，直接返回
+        # 单作者单邮箱，直接返回，并记录相似度
         if n_auth == 1:
             short, country = author_entries[0]
+            score = _calculate_match_score(short, email_list[0])
             return [
-                AuthorContact(short_name=short, email=email_list[0], country=country, full_name=None)
+                AuthorContact(short_name=short, email=email_list[0], country=country, full_name=None, similarity=score)
             ]
         
         # 多作者单邮箱，选择相似度最高的
@@ -383,7 +385,7 @@ def parse_and_align_authors(
         
         short, country = author_entries[best_idx]
         return [
-            AuthorContact(short_name=short, email=email_list[0], country=country, full_name=None)
+            AuthorContact(short_name=short, email=email_list[0], country=country, full_name=None, similarity=best_score)
         ]
 
     # 场景 B：多邮箱场景
@@ -417,10 +419,10 @@ def parse_and_align_authors(
             
             used_authors.add(auth_idx)
             used_emails.add(email_idx)
-            matched_pairs.append((auth_idx, email_idx))
+            matched_pairs.append((score, auth_idx, email_idx))
         
         # 按作者原本顺序排序
-        matched_pairs.sort(key=lambda x: x[0])
+        matched_pairs.sort(key=lambda x: x[1])
         
         # 当使用 Addresses 列时，直接将其中的名字作为 full_name
         return [
@@ -428,9 +430,10 @@ def parse_and_align_authors(
                 short_name=addresses_authors[ai][0],
                 email=email_list[ei],
                 country=addresses_authors[ai][1],
-                full_name=addresses_authors[ai][0]  # 直接使用 Addresses 列中的名字作为 full_name
+                full_name=addresses_authors[ai][0],
+                similarity=score
             )
-            for ai, ei in matched_pairs
+            for score, ai, ei in matched_pairs
         ]
     
     # 否则回退到使用 Reprint Addresses 列
@@ -454,19 +457,20 @@ def parse_and_align_authors(
 
         used_authors.add(auth_idx)
         used_emails.add(email_idx)
-        matched_pairs.append((auth_idx, email_idx))
+        matched_pairs.append((score, auth_idx, email_idx))
 
     # 按作者原本顺序排序
-    matched_pairs.sort(key=lambda x: x[0])
+    matched_pairs.sort(key=lambda x: x[1])
 
     return [
         AuthorContact(
             short_name=author_entries[ai][0],
             email=email_list[ei],
             country=author_entries[ai][1],
-            full_name=None  # 使用 Reprint Addresses 列时，full_name 将通过后续的 map_short_to_full_names 填充
+            full_name=None,
+            similarity=score
         )
-        for ai, ei in matched_pairs
+        for score, ai, ei in matched_pairs
     ]
 
 

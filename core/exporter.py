@@ -4,6 +4,7 @@ import json
 import os
 import re
 import sqlite3
+import time
 from typing import List, Optional, Sequence, Tuple
 
 import pandas as pd
@@ -114,29 +115,22 @@ def _is_chinese_name(full_name: str, short_name: str) -> bool:
 
 
 def _is_china_country(country: str) -> bool:
-    """
-    判断国家字段是否可以视为“中国籍”（包含港澳台等常见写法）。
-    """
     if not country:
         return False
     text = str(country).upper()
-    
-    # 严格匹配词边界，避免匹配到 "INDOCHINA" 等词
-    # 简单起见，检查是否包含特定短语
-    
-    # 1. 明确的中国关键词
-    if "PEOPLES R CHINA" in text or "P R CHINA" in text or "PEOPLE'S R CHINA" in text:
+
+    # 若包含港澳台关键词，则不视为中国大陆
+    if ("HONG KONG" in text) or ("MACAU" in text) or ("MACAO" in text) or ("TAIWAN" in text):
+        return False
+
+    # 明确的中国大陆关键词
+    if ("PEOPLES R CHINA" in text) or ("P R CHINA" in text) or ("PEOPLE'S R CHINA" in text) or re.search(r"\bMAINLAND CHINA\b", text):
         return True
-        
-    # 2. 港澳台
-    if "HONG KONG" in text or "MACAU" in text or "MACAO" in text or "TAIWAN" in text:
+
+    # 单独的 "CHINA"（排除诸如 INDOCHINA 等情况由单词边界控制）
+    if re.search(r"\bCHINA\b", text):
         return True
-        
-    # 3. 单独的 "CHINA"，需要排除前缀后缀（如 INDOCHINA）
-    # 使用正则进行单词匹配
-    if re.search(r'\bCHINA\b', text):
-        return True
-        
+
     return False
 
 
@@ -247,6 +241,7 @@ def export_to_excel_by_tags(
     include_file_name: bool = True,
     include_country: bool = True,
     include_ethnic_chinese: bool = True,
+    min_similarity: Optional[float] = None,
 ) -> List[str]:
     """
     按 WoS / Research Areas 关键词从 SQLite 导出记录到 Excel，并按块切分。
@@ -279,8 +274,8 @@ def export_to_excel_by_tags(
         
         select_sql = f"""
             SELECT
-                id, file_name, row_index, short_name, country, full_name,
-                email, wos_categories, research_areas, email_validity
+                id, file_name, row_index, short_name, country, ethnic_chinese, full_name,
+                email, wos_categories, research_areas, email_validity, similarity
             FROM records
             {base_where} id > ?
             ORDER BY id ASC
@@ -311,6 +306,7 @@ def export_to_excel_by_tags(
         else:
             label_base = "_".join(label_parts)
         safe_label = re.sub(r"[^A-Za-z0-9_.-]+", "_", label_base)
+        run_ts = time.strftime("%Y%m%d_%H%M%S")
 
         columns = [
             "id",  # 为了调试和追踪，包含ID
@@ -318,11 +314,13 @@ def export_to_excel_by_tags(
             "row_index",
             "short_name",
             "country",
+            "ethnic_chinese",
             "full_name",
             "email",
             "wos_categories",
             "research_areas",
             "email_validity",
+            "similarity",
         ]
         
         # Excel 默认导出列（不含 id），再根据参数决定是否导出原始文件名/国家/华人华裔列
@@ -354,20 +352,16 @@ def export_to_excel_by_tags(
                 df = pd.DataFrame(rows, columns=columns)
                 if "row_index" in df.columns:
                     df["row_index"] = df["row_index"].astype(int) + 2
-                if include_ethnic_chinese:
-                    df["ethnic_chinese"] = df.apply(
-                        lambda r: classify_ethnic_chinese(
-                            full_name=r.get("full_name", "") or "",
-                            short_name=r.get("short_name", "") or "",
-                            country=r.get("country", "") or "",
-                        ),
-                        axis=1,
-                    )
+                # ethnic_chinese 列来自数据库
+                if min_similarity is not None and "similarity" in df.columns:
+                    df["similarity"] = pd.to_numeric(df["similarity"], errors="coerce").fillna(0.0)
+                    df = df[df["similarity"] >= float(min_similarity)]
                 accumulated_rows = [tuple(x) for x in df.to_records(index=False)]
             else:
                 # 需要按 ethnic_filters 过滤：循环拉取小批量，累积满足过滤的行
                 while len(accumulated_rows) < chunk_size:
-                    query_params = list(params) + [last_id, fetch_batch_size]
+                    # Fix: use max_id_seen_in_round instead of last_id to advance cursor in inner loop
+                    query_params = list(params) + [max_id_seen_in_round, fetch_batch_size]
                     cur = conn.execute(select_sql, query_params)
                     rows = cur.fetchall()
                     if not rows:
@@ -380,15 +374,11 @@ def export_to_excel_by_tags(
                     if "row_index" in df.columns:
                         df["row_index"] = df["row_index"].astype(int) + 2
 
-                    df["ethnic_chinese"] = df.apply(
-                        lambda r: classify_ethnic_chinese(
-                            full_name=r.get("full_name", "") or "",
-                            short_name=r.get("short_name", "") or "",
-                            country=r.get("country", "") or "",
-                        ),
-                        axis=1,
-                    )
+                    # ethnic_chinese 列来自数据库
                     matched = df[df["ethnic_chinese"].isin(list(ethnic_filters))]
+                    if min_similarity is not None and "similarity" in matched.columns:
+                        matched["similarity"] = pd.to_numeric(matched["similarity"], errors="coerce").fillna(0.0)
+                        matched = matched[matched["similarity"] >= float(min_similarity)]
                     if not matched.empty:
                         accumulated_rows.extend([tuple(x) for x in matched.to_records(index=False)])
 
@@ -400,8 +390,6 @@ def export_to_excel_by_tags(
 
             # 根据是否包含 ethnic_chinese 列来确定正确的列名
             out_columns_for_df = list(columns)
-            if include_ethnic_chinese and accumulated_rows and len(accumulated_rows[0]) > len(columns):
-                out_columns_for_df.append("ethnic_chinese")
             
             out_df = pd.DataFrame(accumulated_rows, columns=out_columns_for_df)
             if out_df.empty:
@@ -424,7 +412,10 @@ def export_to_excel_by_tags(
             if include_ethnic_chinese:
                 out_columns.append("ethnic_chinese")
 
-            out_name = f"{safe_label}_{chunk_index:04d}.xlsx"
+            sim_tag = ""
+            if min_similarity is not None and float(min_similarity) > 0.0:
+                sim_tag = f"_minSim{int(round(float(min_similarity) * 100))}"
+            out_name = f"{safe_label}{sim_tag}_{run_ts}_{chunk_index:04d}.xlsx"
             out_path = os.path.join(output_dir, out_name)
 
             out_df[out_columns].to_excel(out_path, index=False)
@@ -433,6 +424,45 @@ def export_to_excel_by_tags(
             chunk_index += 1
 
         return exported_files
+    finally:
+        conn.close()
+
+def reclassify_ethnic_chinese(db_path: str, batch_size: int = 10000) -> int:
+    conn = sqlite3.connect(db_path)
+    try:
+        _ensure_db_schema(conn)
+        total = 0
+        last_id = 0
+        while True:
+            cur = conn.execute(
+                """
+                SELECT id, full_name, short_name, country
+                FROM records
+                WHERE id > ?
+                ORDER BY id ASC
+                LIMIT ?
+                """,
+                (last_id, int(batch_size)),
+            )
+            rows = cur.fetchall()
+            if not rows:
+                break
+            updates = []
+            for row in rows:
+                rid = int(row[0])
+                full_name = str(row[1] or "")
+                short_name = str(row[2] or "")
+                country = str(row[3] or "")
+                cls = classify_ethnic_chinese(full_name, short_name, country)
+                updates.append((cls, rid))
+            conn.executemany(
+                "UPDATE records SET ethnic_chinese = ? WHERE id = ?",
+                updates,
+            )
+            conn.commit()
+            last_id = max(int(r[0]) for r in rows)
+            total += len(rows)
+        return total
     finally:
         conn.close()
 
@@ -480,6 +510,157 @@ def remove_duplicates(db_path: str) -> int:
              conn.execute("VACUUM")
 
         return removed_count
+    finally:
+        conn.close()
+
+
+def _generate_new_db_path(original: str, suffix: str) -> str:
+    base_dir = os.path.dirname(os.path.abspath(original))
+    stem = os.path.splitext(os.path.basename(original))[0]
+    ts = time.strftime("%Y%m%d_%H%M%S")
+    candidate = os.path.join(base_dir, f"{stem}_{suffix}_{ts}.db")
+    if not os.path.exists(candidate):
+        return candidate
+    i = 1
+    while True:
+        alt = os.path.join(base_dir, f"{stem}_{suffix}_{ts}_{i}.db")
+        if not os.path.exists(alt):
+            return alt
+        i += 1
+
+
+def remove_duplicates_to_new_db(db_path: str, output_db_path: Optional[str] = None) -> Tuple[str, int, int]:
+    """
+    非破坏性“普通去重”：基于 (short_name, email) 组合保留 id 最小的一条，
+    将结果写入新的 SQLite 文件，不修改原库。
+
+    返回 (新库路径, 保留条数, 删除条数)。
+    """
+    if not os.path.exists(db_path):
+        raise FileNotFoundError(f"SQLite 文件不存在：{db_path}")
+
+    new_db = output_db_path or _generate_new_db_path(db_path, "dedup")
+
+    conn = sqlite3.connect(new_db)
+    try:
+        _ensure_db_schema(conn)
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_records_dedup ON records(short_name, email)")
+        conn.commit()
+
+        conn.execute("ATTACH DATABASE ? AS src_db", (os.path.abspath(db_path),))
+
+        conn.execute(
+            """
+            INSERT INTO records (
+                file_name, row_index, short_name, country, ethnic_chinese, full_name,
+                email, wos_categories, research_areas,
+                raw_reprint, raw_email, email_validity, email_validation_attempts, similarity
+            )
+            SELECT
+                r.file_name, r.row_index, r.short_name, r.country, r.ethnic_chinese, r.full_name,
+                r.email, r.wos_categories, r.research_areas,
+                r.raw_reprint, r.raw_email, r.email_validity, r.email_validation_attempts, COALESCE(r.similarity, 0.0)
+            FROM src_db.records AS r
+            JOIN (
+                SELECT short_name, email, MIN(id) AS min_id
+                FROM src_db.records
+                GROUP BY short_name, email
+            ) AS t
+            ON r.short_name = t.short_name AND r.email = t.email AND r.id = t.min_id
+            """
+        )
+
+        # 复制 errors 表（不参与去重）
+        conn.execute(
+            """
+            INSERT INTO errors (
+                file_name, row_index, reason,
+                raw_reprint, raw_email, raw_row
+            )
+            SELECT file_name, row_index, reason, raw_reprint, raw_email, raw_row
+            FROM src_db.errors
+            """
+        )
+        conn.commit()
+
+        cur = conn.execute("SELECT COUNT(*) FROM records")
+        kept = int(cur.fetchone()[0])
+        cur2 = conn.execute("SELECT COUNT(*) FROM src_db.records")
+        original = int(cur2.fetchone()[0])
+        removed = original - kept
+        # 清理附件
+        conn.execute("DETACH DATABASE src_db")
+        return new_db, kept, removed
+    finally:
+        conn.close()
+
+
+def deduplicate_by_similarity(db_path: str, output_db_path: Optional[str] = None) -> Tuple[str, int, int]:
+    """
+    精细化去重：按邮箱分组，仅保留“相似度最高”的一条（相同相似度时取 id 最小），
+    写入新的 SQLite 文件，不修改原库。
+
+    返回 (新库路径, 保留条数, 删除条数)。
+    """
+    if not os.path.exists(db_path):
+        raise FileNotFoundError(f"SQLite 文件不存在：{db_path}")
+
+    new_db = output_db_path or _generate_new_db_path(db_path, "email_dedup")
+
+    conn = sqlite3.connect(new_db)
+    try:
+        _ensure_db_schema(conn)
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_records_email ON records(email)")
+        conn.commit()
+
+        conn.execute("ATTACH DATABASE ? AS src_db", (os.path.abspath(db_path),))
+
+        # 使用联接与排除法选择“相似度最高且最小 id”的记录
+        conn.execute(
+            """
+            INSERT INTO records (
+                file_name, row_index, short_name, country, ethnic_chinese, full_name,
+                email, wos_categories, research_areas,
+                raw_reprint, raw_email, email_validity, email_validation_attempts, similarity
+            )
+            SELECT
+                r.file_name, r.row_index, r.short_name, r.country, r.ethnic_chinese, r.full_name,
+                r.email, r.wos_categories, r.research_areas,
+                r.raw_reprint, r.raw_email, r.email_validity, r.email_validation_attempts, COALESCE(r.similarity, 0.0)
+            FROM src_db.records AS r
+            JOIN (
+                SELECT email, MAX(COALESCE(similarity, 0.0)) AS max_sim
+                FROM src_db.records
+                GROUP BY email
+            ) AS m
+              ON r.email = m.email AND COALESCE(r.similarity, 0.0) = m.max_sim
+            LEFT JOIN src_db.records AS r2
+              ON r2.email = r.email
+             AND COALESCE(r2.similarity, 0.0) = COALESCE(r.similarity, 0.0)
+             AND r2.id < r.id
+            WHERE r2.id IS NULL
+            """
+        )
+
+        conn.execute(
+            """
+            INSERT INTO errors (
+                file_name, row_index, reason,
+                raw_reprint, raw_email, raw_row
+            )
+            SELECT file_name, row_index, reason, raw_reprint, raw_email, raw_row
+            FROM src_db.errors
+            """
+        )
+        conn.commit()
+
+        cur = conn.execute("SELECT COUNT(*) FROM records")
+        kept = int(cur.fetchone()[0])
+        cur2 = conn.execute("SELECT COUNT(*) FROM src_db.records")
+        original = int(cur2.fetchone()[0])
+        removed = original - kept
+        conn.execute("DETACH DATABASE src_db")
+        return new_db, kept, removed
     finally:
         conn.close()
 
@@ -586,4 +767,105 @@ def export_errors_to_excel(
         return exported_files
     finally:
         conn.close()
+def create_low_similarity_db(
+    db_path: str,
+    min_similarity: float,
+    wos_keywords: Optional[Sequence[str]] = None,
+    research_keywords: Optional[Sequence[str]] = None,
+    file_name_keywords: Optional[Sequence[str]] = None,
+    country_keywords: Optional[Sequence[str]] = None,
+    ethnic_filters: Optional[Sequence[str]] = None,
+    output_db_path: Optional[str] = None,
+) -> Tuple[str, int]:
+    """
+    基于当前过滤条件，生成“低相似度”记录的新库：
+    - 选择 COALESCE(similarity, 0.0) < min_similarity 的记录；
+    - 不修改原库，写入新的 SQLite 文件；
+    - 复制 errors 表，便于追踪。
 
+    返回 (新库路径, 记录条数)。
+    注：ethnic 过滤在导出阶段计算，数据库不存储该列，因此此处仅按 WoS/Research/文件名/国家过滤。
+    """
+    if not os.path.exists(db_path):
+        raise FileNotFoundError(f"SQLite 文件不存在：{db_path}")
+
+    # 生成新库文件名：<原库名>_lowSim_minXX_YYYYmmdd_HHMMSS.db
+    base_dir = os.path.dirname(os.path.abspath(db_path))
+    stem = os.path.splitext(os.path.basename(db_path))[0]
+    percent = int(round(float(min_similarity) * 100))
+    run_ts = time.strftime("%Y%m%d_%H%M%S")
+    candidate = os.path.join(base_dir, f"{stem}_lowSim_min{percent}_{run_ts}.db")
+    new_db = output_db_path or candidate
+    if os.path.exists(new_db):
+        # 回避极端撞名
+        i = 1
+        while True:
+            alt = os.path.join(base_dir, f"{stem}_lowSim_min{percent}_{run_ts}_{i}.db")
+            if not os.path.exists(alt):
+                new_db = alt
+                break
+            i += 1
+
+    conn = sqlite3.connect(new_db)
+    try:
+        _ensure_db_schema(conn)
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_records_filename ON records(file_name)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_records_wos ON records(wos_categories)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_records_research ON records(research_areas)")
+        conn.commit()
+
+        # 附加原库
+        conn.execute("ATTACH DATABASE ? AS src_db", (os.path.abspath(db_path),))
+
+        where, params = _build_filter_sql(
+            wos_keywords=wos_keywords,
+            research_keywords=research_keywords,
+            file_name_keywords=file_name_keywords,
+            country_keywords=country_keywords,
+        )
+
+        base_where = " WHERE " if not where else where + " AND "
+
+        # 插入低相似度记录
+        insert_sql = (
+            """
+            INSERT INTO records (
+                file_name, row_index, short_name, country, ethnic_chinese, full_name,
+                email, wos_categories, research_areas,
+                raw_reprint, raw_email, email_validity, email_validation_attempts, similarity
+            )
+            SELECT
+                r.file_name, r.row_index, r.short_name, r.country, r.ethnic_chinese, r.full_name,
+                r.email, r.wos_categories, r.research_areas,
+                r.raw_reprint, r.raw_email, r.email_validity, r.email_validation_attempts, COALESCE(r.similarity, 0.0)
+            FROM src_db.records AS r
+            """
+            + base_where
+            + (" r.ethnic_chinese IN (" + ",".join(["?"] * len(ethnic_filters)) + ") AND" if ethnic_filters else "")
+            + " COALESCE(r.similarity, 0.0) < ?"
+        )
+        bind_params = list(params)
+        if ethnic_filters:
+            bind_params.extend(list(ethnic_filters))
+        bind_params.append(float(min_similarity))
+        conn.execute(insert_sql, bind_params)
+
+        # 复制 errors 表便于上下文追踪
+        conn.execute(
+            """
+            INSERT INTO errors (
+                file_name, row_index, reason,
+                raw_reprint, raw_email, raw_row
+            )
+            SELECT file_name, row_index, reason, raw_reprint, raw_email, raw_row
+            FROM src_db.errors
+            """
+        )
+        conn.commit()
+
+        cur = conn.execute("SELECT COUNT(*) FROM records")
+        kept = int(cur.fetchone()[0])
+        conn.execute("DETACH DATABASE src_db")
+        return new_db, kept
+    finally:
+        conn.close()

@@ -34,6 +34,7 @@ from PyQt5.QtWidgets import (
     QPushButton,
     QProgressBar,
     QSpinBox,
+    QDoubleSpinBox,
     QTextEdit,
     QVBoxLayout,
     QWidget,
@@ -42,7 +43,7 @@ from PyQt5.QtWidgets import (
 )
 
 from core.concurrency import run_etl
-from core.exporter import export_errors_to_excel, export_to_excel_by_tags, remove_duplicates
+from core.exporter import export_errors_to_excel, export_to_excel_by_tags, remove_duplicates_to_new_db, deduplicate_by_similarity, create_low_similarity_db
 from core.email_validation import is_email_syntax_valid, validate_all_emails_in_db
 
 
@@ -210,6 +211,23 @@ class MainWindow(QMainWindow):
 
         filter_layout.addLayout(filter_form)
 
+        # 导出数据库选择
+        export_db_row = QHBoxLayout()
+        self.export_db_path_edit = QLineEdit("")
+        self.export_db_path_edit.setPlaceholderText("选择用于导出的 SQLite 数据库（留空则使用上方的数据库）")
+        export_db_browse_btn = QPushButton("选择导出数据库")
+        export_db_browse_btn.clicked.connect(self._on_browse_export_db_path)
+        export_db_row.addWidget(self.export_db_path_edit)
+        export_db_row.addWidget(export_db_browse_btn)
+        filter_form.addRow("导出数据库路径：", export_db_row)
+
+        # 最小相似度阈值
+        self.min_similarity_spin = QDoubleSpinBox()
+        self.min_similarity_spin.setRange(0.0, 1.0)
+        self.min_similarity_spin.setSingleStep(0.01)
+        self.min_similarity_spin.setValue(0.40)
+        filter_form.addRow("最小相似度：", self.min_similarity_spin)
+
         # 导出列选项
         export_cols_group = QGroupBox("导出列选项")
         export_cols_layout = QHBoxLayout(export_cols_group)
@@ -298,9 +316,13 @@ class MainWindow(QMainWindow):
         self.export_errors_btn.clicked.connect(self._on_export_errors)
         ctrl_layout.addWidget(self.export_errors_btn)
 
-        self.dedup_btn = QPushButton("数据库去重")
+        self.dedup_btn = QPushButton("普通去重")
         self.dedup_btn.clicked.connect(self._on_deduplicate)
         ctrl_layout.addWidget(self.dedup_btn)
+
+        self.dedup_sim_btn = QPushButton("精细化去重")
+        self.dedup_sim_btn.clicked.connect(self._on_deduplicate_similarity)
+        ctrl_layout.addWidget(self.dedup_sim_btn)
 
         # 按钮功能：对数据库中“未验证或当前标记为不可验证”的邮箱，
         # 进行批量验证，并按照上方的“自动重试次数”参数，在单次任务内自动重试。
@@ -446,6 +468,9 @@ class MainWindow(QMainWindow):
         # 基本路径
         self.input_dir_edit.setText(str(data.get("input_dir", "")))
         self.db_path_edit.setText(str(data.get("db_path", self.db_path_edit.text())))
+        # 导出数据库路径（默认回退到主数据库路径）
+        self.export_db_path_edit.setText(str(data.get("export_db_path", self.db_path_edit.text())))
+        self.min_similarity_spin.setValue(float(data.get("min_similarity", self.min_similarity_spin.value())))
 
         # 列名与过滤条件
         self.col_author_full.setText(str(data.get("col_author_full", self.col_author_full.text())))
@@ -480,6 +505,8 @@ class MainWindow(QMainWindow):
         data: Dict[str, Any] = {
             "input_dir": self.input_dir_edit.text().strip(),
             "db_path": self.db_path_edit.text().strip(),
+            "export_db_path": self.export_db_path_edit.text().strip(),
+            "min_similarity": float(self.min_similarity_spin.value()),
             "col_author_full": self.col_author_full.text().strip(),
             "col_reprint": self.col_reprint.text().strip(),
             "col_email": self.col_email.text().strip(),
@@ -534,6 +561,23 @@ class MainWindow(QMainWindow):
         )
         if file_path:
             self.db_path_edit.setText(file_path)
+
+    def _on_browse_export_db_path(self) -> None:
+        file_path, _ = QFileDialog.getOpenFileName(
+            self,
+            "选择用于导出的 SQLite 数据库文件",
+            self.export_db_path_edit.text() or self.db_path_edit.text(),
+            "SQLite Database (*.db);;All Files (*)"
+        )
+        if file_path:
+            self.export_db_path_edit.setText(file_path)
+
+    def _get_export_db_path(self) -> str:
+        # 优先使用导出数据库字段，留空则回退到主数据库字段
+        candidate = self.export_db_path_edit.text().strip()
+        if candidate:
+            return candidate
+        return self.db_path_edit.text().strip() or "journal_cleaner.db"
 
     def _on_start_etl(self) -> None:
         input_dir = self.input_dir_edit.text().strip()
@@ -610,10 +654,13 @@ class MainWindow(QMainWindow):
              self._append_log("正在进行导出任务，请稍候...")
              return
 
-        db_path = self.db_path_edit.text().strip() or "journal_cleaner.db"
+        db_path = self._get_export_db_path()
         if not os.path.isabs(db_path):
             db_path = os.path.abspath(db_path)
             self.db_path_edit.setText(db_path)
+            # 若导出数据库与主数据库不同，保持导出字段同步为绝对路径
+            if self.export_db_path_edit.text().strip():
+                self.export_db_path_edit.setText(db_path)
         if not os.path.exists(db_path):
             self._append_log(f"SQLite 文件不存在：{db_path}")
             return
@@ -641,6 +688,7 @@ class MainWindow(QMainWindow):
         def export_target():
             try:
                 self.progress_events.put({"type": "export_start", "message": "正在导出清洗结果数据..."})
+                min_sim = float(self.min_similarity_spin.value())
                 files = export_to_excel_by_tags(
                     db_path,
                     output_dir,
@@ -653,7 +701,19 @@ class MainWindow(QMainWindow):
                     include_file_name=include_file_name,
                     include_country=include_country,
                     include_ethnic_chinese=include_ethnic,
+                    min_similarity=min_sim if min_sim > 0.0 else None,
                 )
+                if min_sim > 0.0:
+                    new_db, low_count = create_low_similarity_db(
+                        db_path=db_path,
+                        min_similarity=min_sim,
+                        wos_keywords=wos_keywords,
+                        research_keywords=research_keywords,
+                        file_name_keywords=file_name_keywords,
+                        country_keywords=country_keywords,
+                        ethnic_filters=ethnic_filters,
+                    )
+                    self.progress_events.put({"type": "log", "message": f"已生成低相似度库（< {min_sim:.2f}）：{new_db}，记录数 {low_count}"})
                 self.progress_events.put({"type": "export_done", "files": files, "title": "数据导出"})
             except Exception as e:
                 self.progress_events.put({"type": "export_error", "message": str(e)})
@@ -679,10 +739,12 @@ class MainWindow(QMainWindow):
              self._append_log("正在进行导出任务，请稍候...")
              return
 
-        db_path = self.db_path_edit.text().strip() or "journal_cleaner.db"
+        db_path = self._get_export_db_path()
         if not os.path.isabs(db_path):
             db_path = os.path.abspath(db_path)
             self.db_path_edit.setText(db_path)
+            if self.export_db_path_edit.text().strip():
+                self.export_db_path_edit.setText(db_path)
         if not os.path.exists(db_path):
             self._append_log(f"SQLite 文件不存在：{db_path}")
             return
@@ -738,7 +800,7 @@ class MainWindow(QMainWindow):
         reply = QMessageBox.question(
             self,
             "确认去重",
-            "将基于 (short_name, email) 对数据库进行去重，保留 id 最小的记录，删除重复项。\n此操作不可逆！\n\n是否继续？",
+            "将基于 (short_name, email) 进行去重，保留 id 最小的记录。\n本操作不会修改原数据库，将生成新的去重数据库文件。\n\n是否继续？",
             QMessageBox.Yes | QMessageBox.No,
             QMessageBox.No
         )
@@ -747,14 +809,61 @@ class MainWindow(QMainWindow):
 
         def dedup_target():
             try:
-                self.progress_events.put({"type": "export_start", "message": "正在执行数据库去重..."})
-                removed_count = remove_duplicates(db_path)
-                self.progress_events.put({"type": "log", "message": f"数据库去重完成，共删除了 {removed_count} 条重复记录。"})
-                self.progress_events.put({"type": "dedup_done"})
+                self.progress_events.put({"type": "export_start", "message": "正在执行数据库去重（非破坏性）..."})
+                new_db, kept, removed = remove_duplicates_to_new_db(db_path)
+                self.progress_events.put({"type": "log", "message": f"去重完成：保留 {kept} 条，删除 {removed} 条。新库：{new_db}"})
+                self.progress_events.put({"type": "dedup_done", "new_db": new_db})
             except Exception as e:
                 self.progress_events.put({"type": "export_error", "message": str(e)})
 
         self.export_thread = threading.Thread(target=dedup_target, daemon=True)
+        self.export_thread.start()
+
+    def _on_deduplicate_similarity(self) -> None:
+        if self.is_processing and not self.writer_done:
+            self._append_log("警告：数据处理尚未完成，去重可能导致数据不一致。")
+            reply = QMessageBox.warning(
+                self,
+                "确认去重",
+                "数据处理尚未完成，建议等待处理完成后再去重。\n\n是否强行继续？",
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.No
+            )
+            if reply != QMessageBox.Yes:
+                return
+
+        if self.is_exporting:
+             self._append_log("正在进行导出/去重任务，请稍候...")
+             return
+
+        db_path = self.db_path_edit.text().strip() or "journal_cleaner.db"
+        if not os.path.isabs(db_path):
+            db_path = os.path.abspath(db_path)
+            self.db_path_edit.setText(db_path)
+        if not os.path.exists(db_path):
+            self._append_log(f"SQLite 文件不存在：{db_path}")
+            return
+
+        reply = QMessageBox.question(
+            self,
+            "确认精细化去重",
+            "将按邮箱分组，仅保留相似度最高的一条记录（相同相似度取最小 id）。\n本操作不会修改原数据库，将生成新的去重数据库文件。\n\n是否继续？",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No
+        )
+        if reply != QMessageBox.Yes:
+            return
+
+        def dedup_sim_target():
+            try:
+                self.progress_events.put({"type": "export_start", "message": "正在执行精细化去重（按邮箱相似度最高）..."})
+                new_db, kept, removed = deduplicate_by_similarity(db_path)
+                self.progress_events.put({"type": "log", "message": f"精细化去重完成：保留 {kept} 条，删除 {removed} 条。新库：{new_db}"})
+                self.progress_events.put({"type": "dedup_done", "new_db": new_db})
+            except Exception as e:
+                self.progress_events.put({"type": "export_error", "message": str(e)})
+
+        self.export_thread = threading.Thread(target=dedup_sim_target, daemon=True)
         self.export_thread.start()
 
     def _on_validate_emails(self) -> None:
@@ -959,6 +1068,9 @@ class MainWindow(QMainWindow):
                 self.export_errors_btn.setEnabled(True)
                 self.dedup_btn.setEnabled(True)
                 self._append_log("去重操作已完成。")
+                new_db = event.get("new_db")
+                if isinstance(new_db, str) and new_db:
+                    self.export_db_path_edit.setText(new_db)
             elif etype == "email_validation_start":
                 total = int(event.get("total_emails") or 0)
                 self.progress_bar.setMaximum(max(total, 1))

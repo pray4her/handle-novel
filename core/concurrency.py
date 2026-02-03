@@ -29,6 +29,7 @@ def _ensure_db_schema(conn: sqlite3.Connection) -> None:
             row_index INTEGER,
             short_name TEXT,
             country TEXT,
+            ethnic_chinese TEXT,
             full_name TEXT,
             email TEXT,
             wos_categories TEXT,
@@ -36,7 +37,8 @@ def _ensure_db_schema(conn: sqlite3.Connection) -> None:
             raw_reprint TEXT,
             raw_email TEXT,
             email_validity TEXT,
-            email_validation_attempts INTEGER
+            email_validation_attempts INTEGER,
+            similarity REAL
         )
         """
     )
@@ -61,8 +63,10 @@ def _ensure_db_schema(conn: sqlite3.Connection) -> None:
     conn.commit()
     # 确保新增列在旧数据库上也存在
     _ensure_column(conn, "records", "country", "TEXT")
+    _ensure_column(conn, "records", "ethnic_chinese", "TEXT")
     _ensure_column(conn, "records", "email_validity", "TEXT")
     _ensure_column(conn, "records", "email_validation_attempts", "INTEGER")
+    _ensure_column(conn, "records", "similarity", "REAL")
     _ensure_column(conn, "errors", "raw_row", "TEXT")
 
 
@@ -108,11 +112,11 @@ def _writer_process(
                     cur.executemany(
                         """
                         INSERT INTO records (
-                            file_name, row_index, short_name, country, full_name,
+                            file_name, row_index, short_name, country, ethnic_chinese, full_name,
                             email, wos_categories, research_areas,
-                            raw_reprint, raw_email
+                            raw_reprint, raw_email, similarity
                         )
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                         """,
                         records_buffer,
                     )
@@ -145,11 +149,11 @@ def _writer_process(
             cur.executemany(
                         """
                         INSERT INTO records (
-                            file_name, row_index, short_name, country, full_name,
+                            file_name, row_index, short_name, country, ethnic_chinese, full_name,
                             email, wos_categories, research_areas,
-                            raw_reprint, raw_email
+                            raw_reprint, raw_email, similarity
                         )
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                         """,
                 records_buffer,
             )
@@ -176,11 +180,11 @@ def _writer_process(
                     cur.executemany(
                         """
                         INSERT INTO records (
-                            file_name, row_index, short_name, country, full_name,
+                            file_name, row_index, short_name, country, ethnic_chinese, full_name,
                             email, wos_categories, research_areas,
-                            raw_reprint, raw_email
+                            raw_reprint, raw_email, similarity
                         )
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                         """,
                         records_buffer,
                     )
@@ -408,5 +412,3 @@ def run_etl(
                 "completed_files": completed_files,
             }
         )
-
-
